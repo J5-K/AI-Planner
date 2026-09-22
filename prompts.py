@@ -28,12 +28,16 @@ extract_prompt = ChatPromptTemplate.from_messages([
 - 최소한 작업별 예상 시간, 계획 기간, 가용 시간은 확인해야 한다.
 - 날짜는 가능하면 YYYY-MM-DD 형식으로 정리한다.
 - 이번 주, 다음 주, 수요일 같은 상대 날짜는 오늘 날짜를 기준으로 계산한다.
+- '다음 주 금요일'은 이번 주 금요일이 아니라 다음 달력 주의 금요일이다.
 - 사용자가 말하지 않은 시간은 임의로 만들지 않는다.
 - 사용자가 구체적인 시간을 말하지 않았다면 시간을 추측하지 않는다.
 - '오전', '오후', '저녁'만 입력된 경우 start_time과 end_time은 null로 둔다.
 - 시간이 필요한 경우 missing_information에 추가한다.
 - 고정 일정의 시작 시간이나 종료 시간이 없으면 missing_information에 추가한다.
 - '저녁', '오후' 같은 표현을 임의의 구체적인 시간으로 바꾸지 않는다.
+- 날짜 범위 전체를 차지하는 출장·여행 같은 일정은 is_all_day=true,
+  date=시작일, end_date=종료일로 기록하고 시간은 null로 둔다.
+- 시작·종료 시간이 명시된 일정은 is_all_day=false로 기록한다.
 - 운동, 공부, 기록처럼 반복 수행하는 작업은 is_recurring=true로 기록한다.
 - 주제 선정, UI 구현, 테스트처럼 한 번 완료하는 작업은 is_recurring=false로 기록한다.
 - 일회성 작업은 frequency_per_week를 null로 둔다.
@@ -73,6 +77,8 @@ extract_prompt = ChatPromptTemplate.from_messages([
 - 사용자가 작업 예상 시간을 명시하면 estimate_source='user'로 기록한다.
 - 사용자가 예상 시간을 말하지 않았다면 estimated_minutes=null,
   estimate_source='unknown'으로 두며 임의로 시간을 만들지 않는다.
+- '오전에 공부', '저녁에 운동'처럼 작업별 선호 시간대가 있으면
+  preferred_period에 morning, afternoon, evening 중 하나로 기록한다.
 """
     ),
     ("human", "{user_input}"),
@@ -167,6 +173,7 @@ Python이 실제 시간 계산을 담당하므로 시간을 직접 만들지 않
 요일 숫자는 월요일=0, 화요일=1, 수요일=2, 목요일=3, 금요일=4, 토요일=5, 일요일=6이다.
 설명에서 고정 일정의 요일이나 시간을 언급할 때는 주어진 정보를 정확히 따른다.
 설명에는 사용자의 목표와 제약을 고려한 핵심 이유만 간결하게 쓴다.
+설명에서 내부 작업 ID나 회차 번호를 나열하지 않는다.
 """),
     ("human", "목표: {goal}\n계획 기간: {period}\n작업: {tasks}\n고정 일정: {events}"),
 ])

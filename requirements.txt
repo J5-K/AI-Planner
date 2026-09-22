@@ -1,5 +1,5 @@
-langchain
-langchain-openai
-gradio
-python-dotenv
-pydantic
+gradio==6.28.0
+langchain==1.4.2
+langchain-openai==1.6.2
+pydantic==2.13.5
+python-dotenv==1.2.3

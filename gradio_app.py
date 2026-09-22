@@ -2,6 +2,7 @@
 
 from datetime import date, datetime, timedelta
 from html import escape
+from collections import Counter
 
 import gradio as gr
 from langchain_core.prompts import ChatPromptTemplate
@@ -15,11 +16,13 @@ from calendar_tools import (
     get_virtual_calendar_events,
 )
 from models import (
-    FixedEvent, Plan, PlanningContext, PlanUpdate, PlanValidation, ScheduleItem,
+    AvailableSlot, FixedEvent, Plan, PlanningContext, PlanUpdate,
+    PlanValidation, ScheduleItem,
 )
 from planner import (
-    apply_suggested_estimates, build_question_needs, create_plan,
-    apply_text_constraints, detect_missing_information, replan,
+    WEEKDAY_NAMES, apply_suggested_estimates, build_question_needs, create_plan,
+    apply_text_constraints, detect_missing_information, extend_unplaced_tasks,
+    replan,
 )
 from prompts import REPLAN_PROMPT
 from scheduler import build_free_slots, validate_plan
@@ -116,6 +119,23 @@ def format_plan_markdown(context, plan, validation, title="생성된 계획"):
                 "계획 기간의 모든 날짜에 일정을 만들 필요가 없다고 판단했습니다."
             )
 
+    if context.available_slots:
+        lines.append("\n### 반영한 가용 시간")
+        for slot in context.available_slots:
+            if slot.date:
+                label = slot.date
+            elif sorted(slot.weekdays) == [0, 1, 2, 3, 4]:
+                label = "평일"
+            elif sorted(slot.weekdays) == [5, 6]:
+                label = "주말"
+            else:
+                label = "·".join(WEEKDAY_NAMES[day] for day in slot.weekdays)
+            if slot.start_time and slot.end_time:
+                time_text = f"{slot.start_time}~{slot.end_time}"
+            else:
+                time_text = f"하루 {slot.available_minutes}분" if slot.available_minutes else "시간 미정"
+            lines.append(f"\n- {label} · {time_text}")
+
     events = get_virtual_calendar_events.invoke({
         "context_json": context.model_dump_json()
     })
@@ -125,9 +145,11 @@ def format_plan_markdown(context, plan, validation, title="생성된 계획"):
             date_text = event["date"]
             if event.get("end_date") and event["end_date"] != event["date"]:
                 date_text += f" ~ {event['end_date']}"
-            lines.append(
-                f"\n- {date_text} {event['start_time']}~{event['end_time']} · {event['title']}"
+            time_text = (
+                "종일" if event.get("is_all_day")
+                else f"{event['start_time']}~{event['end_time']}"
             )
+            lines.append(f"\n- {date_text} {time_text} · {event['title']}")
 
     lines.append("\n### 실행 일정")
     weekdays = ["월", "화", "수", "목", "금", "토", "일"]
@@ -143,14 +165,16 @@ def format_plan_markdown(context, plan, validation, title="생성된 계획"):
 
     if plan.warnings:
         lines.append(
-            f"\n### ⚠️ 부분 계획: {len(plan.warnings)}개 작업을 배치하지 못했습니다."
+            f"\n### 🚨 부분 계획: {len(plan.warnings)}개 작업을 배치하지 못했습니다."
         )
-        lines.extend(f"\n- {warning}" for warning in plan.warnings)
-        lines.append("\n\n**해결 방법**")
-        lines.append("\n- 계획 종료일을 늘리기")
-        lines.append("\n- 주말이나 다른 시간대를 가용 시간으로 추가하기")
-        lines.append("\n- 작업 시간을 줄이거나 작업을 나눌 수 있게 변경하기")
-        lines.append("\n- 새 고정 일정의 기간을 다시 확인하기")
+        warning_counts = Counter(plan.warnings)
+        for warning, count in warning_counts.items():
+            suffix = f" ({count}건)" if count > 1 else ""
+            lines.append(f"\n- {warning}{suffix}")
+        lines.append(
+            "\n\n> 아래 **미배치 해결** 탭에서 여유일 사용, 기간 연장, "
+            "추가 가능 시간 등록을 바로 실행할 수 있습니다."
+        )
     lines.append(f"\n### 계획 이유\n\n{plan.explanation}")
     if not validation.is_valid:
         result = "충돌 발견"
@@ -195,9 +219,13 @@ def weekly_calendar_html(context, plan):
             if day.weekday() in context.unavailable_weekdays:
                 cards.append("<div class='event-card unavailable-card'>계획 불가</div>")
             for event in fixed_map.get(day.isoformat(), []):
+                time_text = (
+                    "종일" if event.get("is_all_day")
+                    else f"{event['start_time']}~{event['end_time']}"
+                )
                 cards.append(
                     f"<div class='event-card fixed-card'><b>{escape(event['title'])}</b>"
-                    f"<small>{event['start_time']}~{event['end_time']}</small></div>"
+                    f"<small>{time_text}</small></div>"
                 )
             for item in sorted(task_map.get(day.isoformat(), []), key=lambda value: value.start_time):
                 cards.append(
@@ -214,7 +242,14 @@ def weekly_calendar_html(context, plan):
             f"<div class='week-grid'>{''.join(days)}</div></section>"
         )
         week_start += timedelta(days=7)
-    return "<div class='calendar-wrap'>" + "".join(weeks) + "</div>"
+    warning = ""
+    if plan.warnings:
+        warning = (
+            f"<div class='calendar-warning'><b>🚨 부분 계획</b><br>"
+            f"{len(plan.warnings)}개 작업이 아직 미배치 상태입니다. "
+            "아래 미배치 해결 탭에서 추가 가능 시간을 등록해 주세요.</div>"
+        )
+    return warning + "<div class='calendar-wrap'>" + "".join(weeks) + "</div>"
 
 
 def generate_plan_output(context):
@@ -234,7 +269,7 @@ def analyze_request(user_input, strategy):
     context = extract_chain.invoke({
         "current_date": date.today().isoformat(), "user_input": user_input,
     })
-    context = apply_text_constraints(context, user_input)
+    context = apply_text_constraints(context, user_input, date.today())
     context.planning_strategy = strategy
     context.missing_information = detect_missing_information(context)
     questions, markdown = make_questions(context)
@@ -281,7 +316,7 @@ def apply_answers(answer_text, context_data, question_data, history, strategy):
     updated = extract_chain.invoke({
         "current_date": date.today().isoformat(), "user_input": merged,
     })
-    updated = apply_text_constraints(updated, merged)
+    updated = apply_text_constraints(updated, merged, date.today())
     updated.planning_strategy = strategy
     updated.missing_information = detect_missing_information(updated)
     questions, markdown = make_questions(updated)
@@ -328,44 +363,94 @@ def build_comparison(previous, updated):
 
 
 def apply_replan(
-    selected_labels, event_title, event_start_at, event_end_at,
+    selected_labels, event_type, event_title,
+    event_start_date, event_end_date, event_start_at, event_end_at,
     note, context_data, plan_data,
 ):
     if not context_data or not plan_data:
-        return "먼저 최초 계획을 생성해 주세요.", "", "", plan_data, gr.update(), []
+        return (
+            "먼저 최초 계획을 생성해 주세요.", "", "", "",
+            context_data, plan_data, gr.update(), [],
+        )
     context = PlanningContext.model_validate(context_data)
     previous = Plan.model_validate(plan_data)
     missed_ids = selected_ids(selected_labels)
     new_events = []
 
-    if event_title or event_start_at or event_end_at:
+    def unchanged_result(message):
+        current_markdown = format_plan_markdown(
+            context,
+            previous,
+            validate_plan(
+                previous,
+                build_free_slots(
+                    context.available_slots, context.fixed_events,
+                    context.start_date, context.end_date,
+                ),
+            ),
+        )
+        return (
+            message, current_markdown, "",
+            weekly_calendar_html(context, previous),
+            context_data, plan_data, gr.update(), plan_rows(previous),
+        )
+
+    has_event_input = any([
+        event_title, event_start_date, event_end_date, event_start_at, event_end_at,
+    ])
+    if has_event_input and event_type == "all_day":
+        if not all([event_title, event_start_date, event_end_date]):
+            return unchanged_result(
+                "종일·기간 일정을 추가하려면 이름·시작 날짜·종료 날짜를 모두 입력해 주세요."
+            )
+        if event_end_date < event_start_date:
+            return unchanged_result("종료 날짜는 시작 날짜보다 빠를 수 없습니다.")
+        if (
+            event_start_date.date() < date.fromisoformat(context.start_date)
+            or event_end_date.date() > date.fromisoformat(context.end_date)
+        ):
+            return unchanged_result(
+                f"새 일정은 현재 계획 기간({context.start_date}~{context.end_date}) 안에서만 "
+                "추가할 수 있습니다. 먼저 미배치 해결 탭에서 계획 기간을 연장하거나 "
+                "기간 안의 날짜를 선택해 주세요."
+            )
+        new_events.append(FixedEvent(
+            id=f"ui-event-{len(context.fixed_events)+1}",
+            title=event_title,
+            date=event_start_date.date().isoformat(),
+            end_date=event_end_date.date().isoformat(),
+            is_all_day=True,
+        ))
+    elif has_event_input and event_type == "timed":
         if not all([event_title, event_start_at, event_end_at]):
-            return (
-                "새 일정을 추가하려면 이름·시작 일시·종료 일시를 모두 입력해 주세요.",
-                "", weekly_calendar_html(context, previous), plan_data, gr.update(), plan_rows(previous),
+            return unchanged_result(
+                "시간 지정 일정을 추가하려면 이름·시작 일시·종료 일시를 모두 입력해 주세요."
             )
         if event_end_at <= event_start_at:
-            return (
-                "새 일정의 종료 일시는 시작 일시보다 늦어야 합니다.",
-                "", weekly_calendar_html(context, previous), plan_data, gr.update(), plan_rows(previous),
+            return unchanged_result("새 일정의 종료 일시는 시작 일시보다 늦어야 합니다.")
+        if (
+            event_start_at.date() < date.fromisoformat(context.start_date)
+            or event_end_at.date() > date.fromisoformat(context.end_date)
+        ):
+            return unchanged_result(
+                f"새 일정은 현재 계획 기간({context.start_date}~{context.end_date}) 안에서만 "
+                "추가할 수 있습니다. 먼저 미배치 해결 탭에서 계획 기간을 연장하거나 "
+                "기간 안의 일시를 선택해 주세요."
             )
         new_events.append(FixedEvent(
             id=f"ui-event-{len(context.fixed_events)+1}",
             title=event_title,
             date=event_start_at.date().isoformat(),
-            end_date=(
-                event_end_at.date().isoformat()
-                if event_end_at.date() != event_start_at.date() else None
-            ),
+            end_date=(event_end_at.date().isoformat() if event_end_at.date() != event_start_at.date() else None),
+            is_all_day=False,
             start_time=event_start_at.strftime("%H:%M"),
             end_time=event_end_at.strftime("%H:%M"),
         ))
 
     missed_ids = list(dict.fromkeys(missed_ids))
     if not missed_ids:
-        return (
-            "체크박스에서 완료하지 못한 작업을 하나 이상 선택해 주세요.",
-            "", weekly_calendar_html(context, previous), plan_data, gr.update(), plan_rows(previous),
+        return unchanged_result(
+            "체크박스에서 완료하지 못한 작업을 하나 이상 선택해 주세요."
         )
 
     updated, validation = replan(
@@ -389,8 +474,8 @@ def apply_replan(
     else:
         status = "선택한 미완료 작업과 새 일정을 반영했습니다."
     return (
-        status, output, weekly_calendar_html(display_context, updated),
-        updated.model_dump(),
+        status, output, output, weekly_calendar_html(display_context, updated),
+        display_context.model_dump(), updated.model_dump(),
         gr.update(choices=plan_choices(updated), value=[]),
         plan_rows(updated),
     )
@@ -439,6 +524,93 @@ def apply_plan_edits(rows, context_data, plan_data):
     )
 
 
+def toggle_event_type(event_type):
+    is_all_day = event_type == "all_day"
+    return (
+        gr.update(visible=is_all_day),
+        gr.update(visible=is_all_day),
+        gr.update(visible=not is_all_day),
+        gr.update(visible=not is_all_day),
+    )
+
+
+def resolution_result(context, message):
+    plan, _, markdown = generate_plan_output(context)
+    remaining = len(plan.warnings)
+    status = (
+        f"{message} 모든 작업을 배치했습니다."
+        if remaining == 0 else
+        f"{message} 다시 계산했지만 {remaining}개 작업은 아직 미배치 상태입니다."
+    )
+    return (
+        status, markdown, markdown, weekly_calendar_html(context, plan),
+        context.model_dump(), plan.model_dump(),
+        gr.update(choices=plan_choices(plan), value=[]), plan_rows(plan),
+    )
+
+
+def use_reserved_day(context_data, plan_data):
+    if not context_data or not plan_data:
+        return "먼저 계획을 생성해 주세요.", "", "", "", context_data, plan_data, gr.update(), []
+    context = PlanningContext.model_validate(context_data)
+    context.planning_strategy = "balanced"
+    return resolution_result(context, "비워 두었던 마지막 가용일을 사용해")
+
+
+def extend_unplaced_period(new_end_at, context_data, plan_data):
+    if not context_data or not plan_data:
+        return "먼저 계획을 생성해 주세요.", "", "", "", context_data, plan_data, gr.update(), []
+    if not new_end_at:
+        return "새 계획 종료 날짜를 선택해 주세요.", "", "", "", context_data, plan_data, gr.update(), []
+    context = PlanningContext.model_validate(context_data)
+    previous_plan = Plan.model_validate(plan_data)
+    try:
+        updated_context, updated_plan, validation = extend_unplaced_tasks(
+            context,
+            previous_plan,
+            new_end_at.date().isoformat(),
+            model,
+        )
+    except ValueError as error:
+        return (
+            str(error), "", "", weekly_calendar_html(context, previous_plan),
+            context_data, plan_data, gr.update(), plan_rows(previous_plan),
+        )
+    markdown = format_plan_markdown(updated_context, updated_plan, validation)
+    remaining = len(updated_plan.unscheduled_tasks)
+    status = (
+        "기존 일정과 반복 횟수는 유지하고 미배치 작업만 연장 구간에 배치했습니다."
+        if remaining == 0 else
+        f"연장 구간에 다시 배치했지만 {remaining}개 작업은 아직 미배치 상태입니다."
+    )
+    return (
+        status, markdown, markdown,
+        weekly_calendar_html(updated_context, updated_plan),
+        updated_context.model_dump(), updated_plan.model_dump(),
+        gr.update(choices=plan_choices(updated_plan), value=[]),
+        plan_rows(updated_plan),
+    )
+
+
+def add_extra_availability(extra_start, extra_end, context_data, plan_data):
+    if not context_data or not plan_data:
+        return "먼저 계획을 생성해 주세요.", "", "", "", context_data, plan_data, gr.update(), []
+    if not extra_start or not extra_end:
+        return "추가로 가능한 시작·종료 일시를 모두 선택해 주세요.", "", "", "", context_data, plan_data, gr.update(), []
+    if extra_end <= extra_start:
+        return "추가 가능 시간의 종료는 시작보다 늦어야 합니다.", "", "", "", context_data, plan_data, gr.update(), []
+    if extra_start.date() != extra_end.date():
+        return "추가 가능 시간은 같은 날짜 안에서 선택해 주세요.", "", "", "", context_data, plan_data, gr.update(), []
+    context = PlanningContext.model_validate(context_data)
+    context.available_slots.append(AvailableSlot(
+        id=f"extra-{len(context.available_slots)+1}",
+        date=extra_start.date().isoformat(),
+        start_time=extra_start.strftime("%H:%M"),
+        end_time=extra_end.strftime("%H:%M"),
+    ))
+    return resolution_result(context, "추가 가능 시간을 반영해")
+
+
 CSS = """
 .gradio-container {max-width: 1180px !important; margin: auto !important;}
 .hero {padding: 24px; border-radius: 18px; background: linear-gradient(135deg,#eef2ff,#f5f3ff);}
@@ -446,6 +618,7 @@ CSS = """
 .section-card {border: 1px solid #e5e7eb; border-radius: 16px; padding: 10px;}
 #status-box {border-left: 4px solid #6366f1; padding-left: 14px;}
 .calendar-wrap {display:flex; flex-direction:column; gap:20px;}
+.calendar-warning {margin-bottom:14px; padding:14px; border-radius:12px; background:#fef2f2; color:#991b1b; border:1px solid #fecaca;}
 .calendar-week h3 {margin:0 0 8px; font-size:15px; color:#4f46e5;}
 .week-grid {display:grid; grid-template-columns:repeat(7,minmax(110px,1fr)); gap:7px; overflow-x:auto;}
 .calendar-day {min-height:130px; padding:8px; border:1px solid #e5e7eb; border-radius:12px; background:#fff;}
@@ -515,26 +688,81 @@ with gr.Blocks(title="AI 동적 플래너") as demo:
                     plan_output = gr.Markdown()
 
     with gr.Tabs():
+        with gr.Tab("미배치 해결"):
+            gr.Markdown("""
+            ### 미배치 작업을 바로 다시 계획하기
+            계획 결과에 `부분 계획` 경고가 있을 때 아래 방법 중 하나를 실행하세요.
+            실행 후 계획과 주간 캘린더가 즉시 갱신됩니다.
+            """)
+            use_buffer_button = gr.Button(
+                "비워 둔 여유일 사용", variant="primary"
+            )
+            with gr.Group():
+                gr.Markdown(
+                    "**기간을 늘려 해결하려면**  \n"
+                    "기존 일정과 반복 작업 횟수는 바꾸지 않고, 현재 미배치 작업만 "
+                    "기존 종료일 다음 날부터 새 종료일까지 배치합니다."
+                )
+                with gr.Row():
+                    extended_end_date = gr.DateTime(
+                        label="새 계획 종료 날짜",
+                        include_time=False, type="datetime", timezone="Asia/Seoul",
+                    )
+                    extend_button = gr.Button(
+                        "미배치 작업만 연장 구간에 배치", variant="secondary"
+                    )
+            with gr.Group():
+                gr.Markdown("**특정 날짜에 추가로 시간을 낼 수 있다면**")
+                with gr.Row():
+                    extra_start = gr.DateTime(
+                        label="추가 가능 시작 일시",
+                        include_time=True, type="datetime", timezone="Asia/Seoul",
+                    )
+                    extra_end = gr.DateTime(
+                        label="추가 가능 종료 일시",
+                        include_time=True, type="datetime", timezone="Asia/Seoul",
+                    )
+                    add_time_button = gr.Button("추가 시간 반영")
+            resolution_output = gr.Markdown()
+
         with gr.Tab("재계획"):
             gr.Markdown("계획대로 끝내지 못한 작업을 선택하세요. 새 일정 입력은 선택 사항입니다.")
             missed_selector = gr.CheckboxGroup(
                 label="계획대로 완료하지 못한 작업", choices=[],
                 info="체크한 작업과 그 이후 일정만 다시 배치합니다.",
             )
+            event_type = gr.Radio(
+                choices=[
+                    ("종일·기간 일정", "all_day"),
+                    ("시간 지정 일정", "timed"),
+                ],
+                value="all_day",
+                label="새 일정 유형(선택)",
+                info="출장·여행처럼 날짜 범위 전체가 불가능하면 종일·기간 일정을 선택합니다.",
+            )
             with gr.Row():
                 event_title = gr.Textbox(
                     label="새 일정 이름(선택)",
                     placeholder="예: 출장, 회의",
-                    info="새 일정을 추가할 때만 아래 시작·종료 일시와 함께 입력합니다.",
+                    info="새 일정을 추가할 때만 날짜 또는 일시와 함께 입력합니다.",
+                )
+                event_start_date = gr.DateTime(
+                    label="시작 날짜(선택)", include_time=False,
+                    type="datetime", timezone="Asia/Seoul",
+                )
+                event_end_date = gr.DateTime(
+                    label="종료 날짜(선택)", include_time=False,
+                    type="datetime", timezone="Asia/Seoul",
+                    info="시작일부터 종료일까지 모든 가용 시간을 막습니다.",
                 )
                 event_start_at = gr.DateTime(
                     label="시작 일시(선택)", include_time=True,
-                    type="datetime", timezone="Asia/Seoul",
+                    type="datetime", timezone="Asia/Seoul", visible=False,
                 )
                 event_end_at = gr.DateTime(
                     label="종료 일시(선택)", include_time=True,
                     type="datetime", timezone="Asia/Seoul",
-                    info="다음 날 이후를 선택하면 여러 날 일정으로 처리합니다.",
+                    visible=False,
                 )
             replan_note = gr.Textbox(
                 label="재계획 메모(선택)",
@@ -571,15 +799,43 @@ with gr.Blocks(title="AI 동적 플래너") as demo:
     replan_button.click(
         apply_replan,
         [
-            missed_selector, event_title, event_start_at, event_end_at,
+            missed_selector, event_type, event_title,
+            event_start_date, event_end_date, event_start_at, event_end_at,
             replan_note, context_state, plan_state,
         ],
-        [status_output, replan_output, calendar_output, plan_state, missed_selector, plan_editor],
+        [
+            status_output, plan_output, replan_output, calendar_output,
+            context_state, plan_state, missed_selector, plan_editor,
+        ],
+    )
+    event_type.change(
+        toggle_event_type,
+        inputs=[event_type],
+        outputs=[event_start_date, event_end_date, event_start_at, event_end_at],
     )
     edit_button.click(
         apply_plan_edits,
         [plan_editor, context_state, plan_state],
         [status_output, edit_output, calendar_output, plan_state, missed_selector, plan_editor],
+    )
+    resolution_outputs = [
+        status_output, plan_output, resolution_output, calendar_output,
+        context_state, plan_state, missed_selector, plan_editor,
+    ]
+    use_buffer_button.click(
+        use_reserved_day,
+        [context_state, plan_state],
+        resolution_outputs,
+    )
+    extend_button.click(
+        extend_unplaced_period,
+        [extended_end_date, context_state, plan_state],
+        resolution_outputs,
+    )
+    add_time_button.click(
+        add_extra_availability,
+        [extra_start, extra_end, context_state, plan_state],
+        resolution_outputs,
     )
 
 

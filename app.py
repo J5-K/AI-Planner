@@ -17,7 +17,7 @@ from prompts import extract_prompt, question_prompt
 
 
 
-load_dotenv()
+load_dotenv(dotenv_path=".env")
 
 model = ChatOpenAI(
     model="gpt-4.1-mini",
@@ -100,14 +100,28 @@ def pair_questions_and_answers(
         for line in answers.splitlines()
         if line.strip()
     ]
+    numbered_answers: dict[int, list[str]] = {}
+    current_number = None
+    for line in answer_lines:
+        numbered = re.match(r"^(\d+)\s*[.)]\s*(.*)$", line)
+        if numbered:
+            current_number = int(numbered.group(1))
+            numbered_answers.setdefault(current_number, []).append(numbered.group(2))
+        elif current_number is not None:
+            numbered_answers[current_number].append(line)
+
     pairs = []
     for index, question in enumerate(question_texts):
-        answer = (
-            answer_lines[index]
-            if index < len(answer_lines)
-            else "답변 없음"
-        )
+        if numbered_answers:
+            answer = "\n".join(numbered_answers.get(index + 1, [])) or "답변 없음"
+        else:
+            answer = answer_lines[index] if index < len(answer_lines) else "답변 없음"
         pairs.append(f"질문: {question}\n답변: {answer}")
+    if not numbered_answers and len(answer_lines) > len(question_texts):
+        pairs.append(
+            "추가 답변(누락하지 말고 관련 질문에 함께 반영):\n"
+            + "\n".join(answer_lines[len(question_texts):])
+        )
     return "\n\n".join(pairs)
 
 def complete_planning_context(original_input: str) -> PlanningContext:
@@ -117,7 +131,9 @@ def complete_planning_context(original_input: str) -> PlanningContext:
         "current_date": current_date,
         "user_input": original_input,
     })
-    context = apply_text_constraints(context, original_input)
+    context = apply_text_constraints(
+        context, original_input, date.fromisoformat(current_date)
+    )
     context.missing_information = detect_missing_information(context)
 
     print("구조화 결과")
@@ -202,7 +218,9 @@ def complete_planning_context(original_input: str) -> PlanningContext:
             "current_date": current_date,
             "user_input": combined_input,
         })
-        context = apply_text_constraints(context, combined_input)
+        context = apply_text_constraints(
+            context, combined_input, date.fromisoformat(current_date)
+        )
 
         print("\n보완된 구조화 결과")
         context.missing_information = detect_missing_information(context)

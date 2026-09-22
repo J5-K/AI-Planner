@@ -46,6 +46,11 @@ class Task(BaseModel):
         description="반복 작업의 주간 수행 횟수. 일회성 작업이면 null"
     )
 
+    preferred_period: Literal["morning", "afternoon", "evening"] | None = Field(
+        default=None,
+        description="사용자가 작업을 선호하는 시간대"
+    )
+
 
 class RecurrenceRule(BaseModel):
     frequency: Literal["daily", "weekly", "monthly"] = Field(
@@ -87,6 +92,10 @@ class FixedEvent(BaseModel):
     end_date: str | None = Field(
         default=None,
         description="여러 날 일정의 종료 날짜. 하루 일정이면 null"
+    )
+    is_all_day: bool = Field(
+        default=False,
+        description="시간 없이 날짜 범위 전체를 차지하는 일정인지 여부"
     )
     start_time: str | None = None
     end_time: str | None = None
@@ -152,6 +161,10 @@ class ScheduleItem(BaseModel):
 class Plan(BaseModel):
     schedule: list[ScheduleItem]
     warnings: list[str] = Field(default_factory=list)
+    unscheduled_tasks: list[Task] = Field(
+        default_factory=list,
+        description="가용 시간 부족으로 아직 배치하지 못한 작업 인스턴스"
+    )
     explanation: str
 
 

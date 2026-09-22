@@ -89,6 +89,8 @@ def expand_fixed_event(
             id=f"{event.id}-{occurrence.isoformat()}",
             title=event.title,
             date=occurrence.isoformat(),
+            end_date=None,
+            is_all_day=event.is_all_day,
             start_time=event.start_time,
             end_time=event.end_time,
             recurrence=None,
@@ -123,7 +125,14 @@ def build_free_slots(
     start, end = _parse_date(plan_start), _parse_date(plan_end)
     event_ranges = []
     for event in expand_fixed_events(fixed_events, plan_start, plan_end):
-        if event.date and event.start_time and event.end_time:
+        if event.date and event.is_all_day:
+            start_day = _parse_date(event.date)
+            end_day = _parse_date(event.end_date or event.date)
+            event_ranges.append((
+                datetime.combine(start_day, time.min),
+                datetime.combine(end_day + timedelta(days=1), time.min),
+            ))
+        elif event.date and event.start_time and event.end_time:
             start_day = _parse_date(event.date)
             end_day = _parse_date(event.end_date or event.date)
             event_ranges.append((
@@ -157,28 +166,47 @@ def build_free_slots(
     return sorted(free)
 
 
-def expand_task_instances(tasks: list[Task], plan_start: str, plan_end: str) -> list[Task]:
-    """반복 작업을 주 단위 횟수만큼 독립적인 배치 단위로 펼친다."""
+def expand_task_instances(
+    tasks: list[Task], plan_start: str, plan_end: str,
+    available_dates: set[date] | None = None,
+) -> list[Task]:
+    """반복 작업을 실제 가용 날짜 안에서 주별 실행 단위로 펼친다."""
     start, end = _parse_date(plan_start), _parse_date(plan_end)
     instances: list[Task] = []
     for task in tasks:
         if not task.is_recurring:
             instances.append(task.model_copy(deep=True))
             continue
-        week_start, number = start, 1
-        while week_start <= end:
-            week_end = min(week_start + timedelta(days=6), end)
-            count = min(task.frequency_per_week or 1, (week_end - week_start).days + 1)
-            for _ in range(count):
+        week_cursor = start - timedelta(days=start.weekday())
+        number = 1
+        while week_cursor <= end:
+            week_start = max(start, week_cursor)
+            week_end = min(week_cursor + timedelta(days=6), end)
+            eligible_dates = [
+                week_start + timedelta(days=offset)
+                for offset in range((week_end - week_start).days + 1)
+                if available_dates is None
+                or week_start + timedelta(days=offset) in available_dates
+            ]
+            count = min(task.frequency_per_week or 1, len(eligible_dates))
+            if count == 1:
+                target_dates = [eligible_dates[0]]
+            elif count > 1:
+                target_dates = [
+                    eligible_dates[round(index * (len(eligible_dates) - 1) / (count - 1))]
+                    for index in range(count)
+                ]
+            else:
+                target_dates = []
+            for target_date in target_dates:
                 instance = task.model_copy(deep=True)
                 instance.id = f"{task.id}-{number}"
-                instance.title = f"{task.title} {number}회차"
-                instance.available_from = week_start.isoformat()
-                if instance.deadline is None or _parse_date(instance.deadline) > week_end:
-                    instance.deadline = week_end.isoformat()
+                instance.title = task.title
+                instance.available_from = target_date.isoformat()
+                instance.deadline = target_date.isoformat()
                 instances.append(instance)
                 number += 1
-            week_start += timedelta(days=7)
+            week_cursor += timedelta(days=7)
     return instances
 
 
@@ -189,19 +217,36 @@ def allocate_tasks(
 ):
     """LLM이 정한 순서의 작업을 실제 빈 시간에 배치한다."""
     slots = [[start, end] for start, end in free_slots]
-    schedule, warnings = [], []
+    schedule, warnings, unscheduled = [], [], []
     recurring_days: set[tuple[str, date]] = set()
     plan_days = sorted({slot[0].date() for slot in slots})
     usable_days = plan_days[:-1] if strategy == "buffer" and len(plan_days) > 1 else plan_days
-    for task_index, task in enumerate(tasks):
+    one_time_total = sum(not task.is_recurring for task in tasks)
+    one_time_index = 0
+    for task in tasks:
         minutes = task.estimated_minutes or 60
         candidates = slots
-        if strategy in {"balanced", "buffer"} and usable_days:
-            denominator = max(len(tasks) - 1, 1)
-            target_index = round(task_index * (len(usable_days) - 1) / denominator)
+        if task.preferred_period:
+            period_ranges = {
+                "morning": (0, 12),
+                "afternoon": (12, 17),
+                "evening": (17, 24),
+            }
+            start_hour, end_hour = period_ranges[task.preferred_period]
+            candidates = [
+                slot for slot in candidates
+                if start_hour <= slot[0].hour < end_hour
+            ]
+        if (
+            strategy in {"balanced", "buffer"}
+            and usable_days
+            and not task.is_recurring
+        ):
+            denominator = max(one_time_total - 1, 1)
+            target_index = round(one_time_index * (len(usable_days) - 1) / denominator)
             target_day = usable_days[target_index]
             candidates = sorted(
-                slots,
+                candidates,
                 key=lambda slot: (
                     slot[0].date() < target_day,
                     abs((slot[0].date() - target_day).days),
@@ -233,8 +278,11 @@ def allocate_tasks(
                 recurring_days.add((recurring_group, item_start.date()))
             break
         else:
-            warnings.append(f"'{task.title}'을 배치할 충분한 연속 시간이 없습니다.")
-    return schedule, warnings
+            warnings.append(f"'{task.title}' 작업을 배치할 충분한 연속 시간이 없습니다.")
+            unscheduled.append(task.model_copy(deep=True))
+        if not task.is_recurring:
+            one_time_index += 1
+    return schedule, warnings, unscheduled
 
 
 def validate_plan(plan: Plan, free_slots: list[tuple[datetime, datetime]]) -> PlanValidation:
